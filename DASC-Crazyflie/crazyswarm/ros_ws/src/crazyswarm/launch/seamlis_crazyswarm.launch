@@ -1,0 +1,97 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- Crazyswarm server / Vicon / radio. -->
+  <arg name="start_crazyswarm" default="true" />
+  <arg name="use_rviz" default="false" />
+
+  <!-- Load CF params only when attaching to an already-running crazyswarm_server. -->
+  <arg name="load_cf_params" default="false" />
+  <arg name="crazyflie_types_file" default="$(find crazyswarm)/launch/crazyflieTypes.yaml" />
+  <arg name="crazyflies_file" default="$(find crazyswarm)/launch/crazyflies.yaml" />
+
+  <!-- Node switches. -->
+  <arg name="run_state_publisher" default="true" />
+  <arg name="run_takeoff_reference_bridge" default="false" />
+  <arg name="run_exploration" default="true" />
+  <arg name="run_state_debug" default="false" />
+
+  <!-- Fixed-height takeoff/reference bridge. -->
+  <arg name="cf_ids" default="" />
+  <arg name="takeoff_duration" default="3.0" />
+  <arg name="state_timeout" default="10.0" />
+  <arg name="shutdown_after_landing" default="true" />
+
+  <!-- SEAMLiS exploration options. -->
+  <arg name="num_agent" default="" />
+  <arg name="algo" default="frontier" />
+  <arg name="layout" default="indoor" />
+  <arg name="use_astar" default="true" />
+  <arg name="attitude" default="gatekeeper" />
+  <arg name="gatekeeper_nominal" default="visibility_area" />
+  <arg name="gatekeeper_backup" default="velocity_tracking_yaw" />
+  <arg name="gatekeeper_nominal_horizon" default="0.4" />
+  <arg name="gatekeeper_backup_horizon" default="1.8" />
+  <arg name="gatekeeper_event_offset" default="0.0" />
+  <arg name="gatekeeper_horizon_discount" default="0.05" />
+  <arg name="gatekeeper_validation_slack" default="0.30" />
+  <arg name="gatekeeper_braking_margin" default="0.90" />
+  <arg name="pos_controller" default="mpc_cbf" />
+  <arg name="coverage_target" default="0.98" />
+  <arg name="unknown_profile" default="default" />
+  <arg name="unknown" default="true" />
+  <arg name="map_resolution" default="0.16" />
+  <arg name="dt" default="0.1" />
+  <arg name="fake_dt" default="0.35" />
+  <arg name="command_rate_hz" default="15.0" />
+  <arg name="velocity_alpha" default="0.5" />
+  <arg name="publish_current_yaw" default="true" />
+  <arg name="show_animation" default="false" />
+  <arg name="save_animation" default="false" />
+  <arg name="visualization_rate_hz" default="5.0" />
+
+  <include if="$(arg start_crazyswarm)" file="$(find crazyswarm)/launch/hover_swarm.launch">
+    <arg name="use_rviz" value="$(arg use_rviz)" />
+  </include>
+
+  <group if="$(arg load_cf_params)">
+    <rosparam command="load" file="$(arg crazyflie_types_file)" />
+    <rosparam command="load" file="$(arg crazyflies_file)" />
+  </group>
+
+  <node
+      if="$(arg run_state_publisher)"
+      pkg="crazyswarm"
+      type="cf_state_publisher_node.py"
+      name="cf_state_publisher"
+      output="screen"
+      launch-prefix="python3" />
+
+  <node
+      if="$(arg run_takeoff_reference_bridge)"
+      pkg="crazyswarm"
+      type="cf_takeoff_reference_bridge_node.py"
+      name="cf_takeoff_reference_bridge"
+      output="screen"
+      launch-prefix="python3"
+      required="$(arg shutdown_after_landing)"
+      args="$(eval '--cf_ids ' + arg('cf_ids') if arg('cf_ids') != '' else '') --takeoff_duration $(arg takeoff_duration) --state_timeout $(arg state_timeout)" />
+
+  <node
+      if="$(arg run_state_debug)"
+      pkg="crazyswarm"
+      type="cf_state_subscriber_node.py"
+      name="cf_state_subscriber"
+      output="screen"
+      launch-prefix="python3">
+    <param name="velocity_alpha" value="$(arg velocity_alpha)" />
+  </node>
+
+  <node
+      if="$(arg run_exploration)"
+      pkg="crazyswarm"
+      type="exploration_crazyswarm_node.py"
+      name="exploration_crazyswarm"
+      output="screen"
+      launch-prefix="python3"
+      args="$(eval '--num_agent ' + arg('num_agent') if arg('num_agent') != '' else '') --algo $(arg algo) --layout $(arg layout) $(eval '--use_astar' if arg('use_astar') == 'true' else '--no-astar') --attitude $(arg attitude) --gatekeeper_nominal $(arg gatekeeper_nominal) --gatekeeper_backup $(arg gatekeeper_backup) --gatekeeper_nominal_horizon $(arg gatekeeper_nominal_horizon) --gatekeeper_backup_horizon $(arg gatekeeper_backup_horizon) --gatekeeper_event_offset $(arg gatekeeper_event_offset) --gatekeeper_horizon_discount $(arg gatekeeper_horizon_discount) --gatekeeper_validation_slack $(arg gatekeeper_validation_slack) --gatekeeper_braking_margin $(arg gatekeeper_braking_margin) --pos_controller $(arg pos_controller) --coverage_target $(arg coverage_target) --unknown_profile $(arg unknown_profile) $(eval '--unknown' if arg('unknown') == 'true' else '--no-unknown') --map_resolution $(arg map_resolution) --dt $(arg dt) --fake_dt $(arg fake_dt) --command_rate_hz $(arg command_rate_hz) --velocity_alpha $(arg velocity_alpha) --visualization_rate_hz $(arg visualization_rate_hz) $(eval '--show_animation' if arg('show_animation') == 'true' else '') $(eval '--save_animation' if arg('save_animation') == 'true' else '') $(eval '--publish_current_yaw' if arg('publish_current_yaw') == 'true' else '--predict_yaw')" />
+</launch>

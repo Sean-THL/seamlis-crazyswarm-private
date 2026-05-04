@@ -1,0 +1,31 @@
+version: "3"
+
+services:
+  ros:
+    # specify where the Dockerfile you want to build is
+    build: . 
+    entrypoint:
+      - /bin/bash
+      - -lc
+      - source /opt/ros/noetic/setup.bash && source /root/crazyswarm/ros_ws/devel/setup.bash && exec bash
+    # allow using the terminal
+    tty: true 
+    # gives the container access to any devices connected to the computer
+    privileged: true
+    # use the computer's networking stack
+    # necessary for two docker containers to be able to talk to each other in ROS2 
+    network_mode: "host" # this 
+    pid: "host"
+    volumes:
+      - ./crazyswarm:/root/crazyswarm
+      - ../seamlis:/root/seamlis
+      # - ~/crazier-workspace/crazyswarm2-setup/colcon_ws:/root/colcon_ws
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ./99-bitcraze.rules:/etc/udev/rules.d/99-bitcraze.rules
+      - /dev:/dev
+    environment:
+      # specify the display drivers
+      - SHORT=ros_ws/src/crazyswarm/scripts/
+      - DISPLAY=$DISPLAY
+      # if you want to specify a ros domain id (or other environment parameters) this is a good place
+      # - ROS_DOMAIN_ID=2 

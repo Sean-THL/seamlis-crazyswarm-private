@@ -1,0 +1,15 @@
+crazyflies:
+- channel: 5
+  id: 6
+  initialPosition:
+  - -1.0
+  - 0.0
+  - 0.0
+  type: defaultSingleMarker
+- channel: 6
+  id: 12
+  initialPosition:
+  - -1.0
+  - -1.0
+  - 0.0
+  type: defaultSingleMarker

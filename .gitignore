@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+*.bag
+*.csv
+*.gif
+*.mp4
+.venv/
+output/
+
+# ROS/catkin generated files
+build/
+devel/
+install/
+logs/
+crazyswarm/bags/
+**/ros_ws/build/
+**/ros_ws/devel/
+**/ros_ws/install/
+
+# Local scratch files from hardware testing
+oldfile/
+pseudo_code
+cf_reference_subscriber.py

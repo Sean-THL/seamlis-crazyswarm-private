@@ -1,0 +1,17 @@
+# Ignore pycache directories
+__pycache__/
+
+# Ignore misc. files
+*.csv
+*.gif
+*.mp4
+*.egg-info/
+.DS_Store
+
+# Ignore directories and files with "images" in their name
+output/
+
+# Currently ignore visibility_rrt, will be updated as a submodule later
+visibility_rrt/
+.venv/
+uv.lock

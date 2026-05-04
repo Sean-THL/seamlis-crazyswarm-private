@@ -1,0 +1,8 @@
+_start.bash
+__pycache__/
+*.pyc
+*.bag
+*.csv
+*.gif
+*.mp4
+crazyswarm/bags/
