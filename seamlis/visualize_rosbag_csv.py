@@ -174,6 +174,16 @@ def _print_series_summary(cf_id, series):
         )
 
 
+def _select_animation_source(series):
+    state = series["state"]
+    cmd = series["cmd"]
+    if _field(state, "field.x").size > 0 and _field(state, "field.y").size > 0:
+        return "state", state, series["state_t"]
+    if _field(cmd, "field.x").size > 0 and _field(cmd, "field.y").size > 0:
+        return "cmd", cmd, series["cmd_t"]
+    return "none", None, np.empty(0, dtype=float)
+
+
 def _set_axes(ax, title):
     ax.set_title(title)
     ax.set_xlabel("Vicon x [m]")
@@ -309,22 +319,29 @@ def plot_animation(
         cf_id: _load_robot_series(bag_dir, cf_id, state_stride=playback_stride, cmd_stride=cmd_stride)
         for cf_id in cf_ids
     }
+    for cf_id, series in series_by_cf.items():
+        _print_series_summary(cf_id, series)
+
+    animation_source_by_cf = {}
     headings_by_cf = {}
     sensed_indices_by_cf = {}
     sensed_next_by_cf = {}
     sensed_patches_by_cf = {}
     for cf_id, series in series_by_cf.items():
-        state = series["state"]
-        sx = _field(state, "field.x")
-        sy = _field(state, "field.y")
-        yaw = _field(state, "yaw")
-        headings_by_cf[cf_id] = _heading_series(sx, sy, yaw, fov_heading)
-        sensed_indices_by_cf[cf_id] = _downsample_indices(sx.size, sensed_stride)
+        source_label, source, _ = _select_animation_source(series)
+        animation_source_by_cf[cf_id] = source_label
+        px = _field(source, "field.x")
+        py = _field(source, "field.y")
+        yaw = _field(source, "yaw")
+        headings_by_cf[cf_id] = _heading_series(px, py, yaw, fov_heading)
+        sensed_indices_by_cf[cf_id] = _downsample_indices(px.size, sensed_stride)
         sensed_next_by_cf[cf_id] = 0
         sensed_patches_by_cf[cf_id] = []
+        if source_label == "cmd":
+            print(f"cf{cf_id}: animating cmd_position because state data is unavailable.")
     max_len = max(
         [
-            _field(series["state"], "field.x").size
+            _field(_select_animation_source(series)[1], "field.x").size
             for series in series_by_cf.values()
         ]
         + [1]
@@ -335,7 +352,7 @@ def plot_animation(
         color = colors[idx % len(colors)]
         state_line, = ax.plot([], [], color=color, linewidth=2.0, label=f"cf{cf_id} state")
         cmd_line, = ax.plot([], [], color=color, linestyle="--", linewidth=1.2, alpha=0.65, label=f"cf{cf_id} cmd")
-        cmd_line.set_visible(show_cmd)
+        cmd_line.set_visible(show_cmd or animation_source_by_cf.get(cf_id) == "cmd")
         point, = ax.plot([], [], color=color, marker="o", markersize=6)
         fov_patch = None
         if show_fov:
@@ -354,27 +371,30 @@ def plot_animation(
             cmd = series["cmd"]
             state_line, cmd_line, point, fov_patch = artists[cf_id]
 
-            sx = _field(state, "field.x")
-            sy = _field(state, "field.y")
-            st = series["state_t"]
+            source_label, source, source_t = _select_animation_source(series)
+            px = _field(source, "field.x")
+            py = _field(source, "field.y")
             heading = headings_by_cf.get(cf_id, np.empty(0, dtype=float))
-            n_state = min(frame + 1, sx.size)
-            if n_state > 0:
-                state_line.set_data(sx[:n_state], sy[:n_state])
-                point.set_data([sx[n_state - 1]], [sy[n_state - 1]])
-                if fov_patch is not None and heading.size >= n_state:
+            n_source = min(frame + 1, px.size)
+            if n_source > 0:
+                if source_label == "state":
+                    state_line.set_data(px[:n_source], py[:n_source])
+                else:
+                    cmd_line.set_data(px[:n_source], py[:n_source])
+                point.set_data([px[n_source - 1]], [py[n_source - 1]])
+                if fov_patch is not None and heading.size >= n_source:
                     fov_patch.set_xy(
-                        _fov_points(sx[n_state - 1], sy[n_state - 1], heading[n_state - 1], fov_angle_deg, cam_range)
+                        _fov_points(px[n_source - 1], py[n_source - 1], heading[n_source - 1], fov_angle_deg, cam_range)
                     )
                     fov_patch.set_visible(True)
-                if show_sensed_area and heading.size >= n_state:
+                if show_sensed_area and heading.size >= n_source:
                     indices = sensed_indices_by_cf[cf_id]
-                    while sensed_next_by_cf[cf_id] < len(indices) and indices[sensed_next_by_cf[cf_id]] < n_state:
+                    while sensed_next_by_cf[cf_id] < len(indices) and indices[sensed_next_by_cf[cf_id]] < n_source:
                         sample_idx = indices[sensed_next_by_cf[cf_id]]
                         sensed_patch = _add_fov_patch(
                             ax,
-                            sx[sample_idx],
-                            sy[sample_idx],
+                            px[sample_idx],
+                            py[sample_idx],
                             heading[sample_idx],
                             state_line.get_color(),
                             fov_angle_deg,
@@ -385,9 +405,9 @@ def plot_animation(
                         sensed_patches_by_cf[cf_id].append(sensed_patch)
                         updated.append(sensed_patch)
                         sensed_next_by_cf[cf_id] += 1
-                max_t = max(max_t, float(st[n_state - 1]) if st.size else 0.0)
+                max_t = max(max_t, float(source_t[n_source - 1]) if source_t.size else 0.0)
 
-            if show_cmd:
+            if show_cmd and source_label != "cmd":
                 cx = _field(cmd, "field.x")
                 cy = _field(cmd, "field.y")
                 n_cmd = min(frame + 1, cx.size)
