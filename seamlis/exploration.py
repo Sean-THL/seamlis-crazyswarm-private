@@ -501,7 +501,7 @@ class ExplorationManager:
         
         return interpolated_points[valid_mask]
 
-    def explore(self, max_steps=None):
+    def explore(self, max_steps=None, step_callback=None):
         '''
         Main exploration loop with goal-based updates
         '''
@@ -546,6 +546,8 @@ class ExplorationManager:
             self.update_visualization()
 
         step_count = 0
+        if step_callback is not None:
+            step_callback(self, step_count, self.last_sim_time)
         while True:
             if max_steps is not None and step_count >= max_steps:
                 self.last_step_count = int(step_count)
@@ -562,6 +564,8 @@ class ExplorationManager:
             step_count += 1
             self.last_step_count = int(step_count)
             self.last_sim_time = float(step_count * self.dt)
+            if step_callback is not None:
+                step_callback(self, step_count, self.last_sim_time)
 
             if self.failed:
                 self.last_termination_reason = 'collision_or_infeasible'

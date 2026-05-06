@@ -1,4 +1,5 @@
 import argparse
+import csv
 import math
 import os
 import sys
@@ -304,6 +305,63 @@ def get_robot_specs(num_agent, use_astar):
     return robot_specs
 
 
+def parse_cf_ids(raw_ids):
+    return [int(item.strip()) for item in raw_ids.split(',') if item.strip()]
+
+
+def make_trajectory_recorder(output_path, cf_ids):
+    output_path = os.path.abspath(os.path.expanduser(output_path))
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    csv_file = open(output_path, 'w', newline='')
+    fieldnames = [
+        'step',
+        'time',
+        'robot_idx',
+        'cf_id',
+        'map_x',
+        'map_y',
+        'vicon_x',
+        'vicon_y',
+        'yaw',
+        'goal_map_x',
+        'goal_map_y',
+    ]
+    writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+    writer.writeheader()
+
+    def _record(manager, step_idx, sim_time):
+        for robot_idx, controller in enumerate(manager.controller_list):
+            position = np.asarray(controller.robot.get_position(), dtype=float).reshape(-1)
+            yaw = float(controller.robot.get_orientation())
+            vicon_x, vicon_y = map_to_vicon_xy(position[0], position[1])
+            goal = getattr(controller, 'goal', None)
+            if goal is None:
+                goal_x = ''
+                goal_y = ''
+            else:
+                goal_vec = np.asarray(goal, dtype=float).reshape(-1)
+                goal_x = goal_vec[0] if goal_vec.size > 0 else ''
+                goal_y = goal_vec[1] if goal_vec.size > 1 else ''
+
+            writer.writerow(
+                {
+                    'step': int(step_idx),
+                    'time': f'{float(sim_time):.6f}',
+                    'robot_idx': int(robot_idx),
+                    'cf_id': int(cf_ids[robot_idx]),
+                    'map_x': f'{position[0]:.6f}',
+                    'map_y': f'{position[1]:.6f}',
+                    'vicon_x': f'{vicon_x:.6f}',
+                    'vicon_y': f'{vicon_y:.6f}',
+                    'yaw': f'{yaw:.6f}',
+                    'goal_map_x': goal_x,
+                    'goal_map_y': goal_y,
+                }
+            )
+
+    return output_path, csv_file, _record
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Run exploration test scenario.')
     parser.add_argument('--num_agent', type=int, default=2, help='Number of robots (supported: 1, 2, 3).')
@@ -408,6 +466,16 @@ def parse_args():
     )
     parser.add_argument('--save_anim', action='store_true', help='Save animation as mp4 (rendering required).')
     parser.add_argument('--no_render', action='store_true', help='Disable live rendering (headless run).')
+    parser.add_argument(
+        '--output_trajectory',
+        default=None,
+        help='Optional CSV path for recording simulated x/y trajectory for hardware replay.',
+    )
+    parser.add_argument(
+        '--cf_ids',
+        default=None,
+        help='Comma-separated Crazyflie IDs for --output_trajectory. Defaults to 1..num_agent.',
+    )
     parser.add_argument('--dt', type=float, default=0.1, help='Simulation step size.')
     parser.add_argument('--tf', type=float, default=300.0, help='Simulation horizon in seconds.')
     unknown_group = parser.add_mutually_exclusive_group()
@@ -498,8 +566,25 @@ def main():
         coverage_target=args.coverage_target,
     )
 
+    trajectory_file = None
+    trajectory_output_path = None
+    trajectory_callback = None
+    if args.output_trajectory:
+        cf_ids = parse_cf_ids(args.cf_ids) if args.cf_ids else list(range(1, args.num_agent + 1))
+        if len(cf_ids) != args.num_agent:
+            raise ValueError(f'--cf_ids length ({len(cf_ids)}) must match --num_agent ({args.num_agent}).')
+        trajectory_output_path, trajectory_file, trajectory_callback = make_trajectory_recorder(
+            args.output_trajectory,
+            cf_ids,
+        )
+
     max_steps = int(args.tf / args.dt)
-    success = manager.explore(max_steps=max_steps)
+    try:
+        success = manager.explore(max_steps=max_steps, step_callback=trajectory_callback)
+    finally:
+        if trajectory_file is not None:
+            trajectory_file.close()
+            print(f'Recorded trajectory CSV: {trajectory_output_path}')
     violation_counts = [len(controller.robot.unsafe_points) for controller in manager.controller_list]
     print(f'Visibility violations per robot: {violation_counts} (total={sum(violation_counts)})')
     if args.attitude == 'gatekeeper':
