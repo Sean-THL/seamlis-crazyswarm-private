@@ -194,70 +194,200 @@ ROS bag recording is useful for debugging, experiment analysis, and replaying da
 
 # 🚀 Operation Mode 2: SEAMLiS Trajectory Generation + Crazyflie Tracking
 
-In this mode, SEAMLiS is used to generate the drone trajectory first.
+In this mode, SEAMLiS is used to generate a trajectory first.  
+The Crazyflies then follow the pre-generated trajectory using Crazyswarm.
 
-The Crazyflie then follows the generated trajectory.
-
-This method separates trajectory generation from real-time feedback control.
+This mode separates trajectory generation from real-time SEAMLiS feedback control.
 
 ---
 
 ## 🔁 Mode 2 System Pipeline
 
 ```text
-SEAMLiS → Generated trajectory → Crazyflie trajectory tracking → Crazyflie
+SEAMLiS trajectory CSV → follow_sim_trajectory_node.py → Crazyflie cmd_position → Crazyflie
 ```
 
 The workflow is:
 
-1. SEAMLiS generates a desired path or trajectory.
-2. The trajectory is converted into Crazyflie-compatible references.
-3. The Crazyflie receives the trajectory commands.
-4. The Crazyflie follows the planned trajectory.
+1. Generate a trajectory from SEAMLiS.
+2. Save the trajectory as a `.csv` file.
+3. Start Crazyswarm.
+4. Record ROS bag data.
+5. Run a dry replay first.
+6. If the dry run is correct, run the real trajectory replay.
+7. The Crazyflies follow the generated trajectory.
 
 ---
 
-## 🧠 Mode 2 Concept
+## 🧭 Mode 2 Launch Instructions
 
-Instead of using SEAMLiS as a fully closed-loop online controller, SEAMLiS can be used as a trajectory planner.
-
-The general procedure is:
-
-1. Define the exploration environment in SEAMLiS.
-2. Generate the desired trajectory for each Crazyflie.
-3. Save or publish the generated trajectory.
-4. Convert the trajectory into Crazyflie reference commands.
-5. Send the trajectory to the Crazyflie.
-6. Let the Crazyflie follow the planned path.
+Open multiple terminals.
 
 ---
 
-## 🧭 Example Mode 2 Workflow
+## Terminal 1: Start Crazyswarm
 
-```text
-SEAMLiS generates waypoints
-        ↓
-Waypoints are converted into Crazyflie references
-        ↓
-Crazyflie receives trajectory commands
-        ↓
-Crazyflie follows the planned path
+If Crazyswarm is not already running, start it first:
+
+```bash
+cd /root/crazyswarm
+source /opt/ros/noetic/setup.bash
+source /root/crazyswarm/ros_ws/devel/setup.bash
+
+roslaunch crazyswarm hover_swarm.launch use_rviz:=false
 ```
 
----
+This starts the Crazyswarm hover and swarm operation launch file.
 
-## ✅ When to Use Mode 2
+The argument:
 
-Use Mode 2 when:
+```bash
+use_rviz:=false
+```
 
-- You want to test a pre-planned trajectory.
-- You do not need online replanning.
-- You want the Crazyflie to follow a fixed SEAMLiS-generated path.
-- You want to separate trajectory generation from real-time feedback control.
-- You want a simpler experiment setup before running full closed-loop exploration.
-- You want to validate the trajectory before flying in a real-world experiment.
+disables RViz during trajectory replay.
 
 ---
+
+## Terminal 2: Record ROS Bag
+
+Open a new terminal and enter the Docker container:
+
+```bash
+docker exec -it dasc-crazyflie-ros-1 bash
+```
+
+Source the ROS environment:
+
+```bash
+source /opt/ros/noetic/setup.bash
+source /root/crazyswarm/ros_ws/devel/setup.bash
+```
+
+Create a folder for the simple trajectory replay bag:
+
+```bash
+mkdir -p /root/crazyswarm/bags/trajectory_replay/simple
+cd /root/crazyswarm/bags/trajectory_replay/simple
+```
+
+Record the required ROS topics:
+
+```bash
+rosbag record \
+  -O seamlis_simple_$(date +%Y%m%d_%H%M%S).bag \
+  /cf6/state \
+  /cf12/state \
+  /cf6/cmd_position \
+  /cf12/cmd_position \
+  /tf \
+  /tf_static \
+  /rosout
+```
+
+This records both the measured Crazyflie states and the commanded trajectory references.
+
+---
+
+## Terminal 3: Dry Run Trajectory Replay
+
+Open another terminal and enter the Docker container:
+
+```bash
+docker exec -it dasc-crazyflie-ros-1 bash
+```
+
+Go to the Crazyswarm scripts directory:
+
+```bash
+cd /root/crazyswarm/ros_ws/src/crazyswarm/scripts
+```
+
+Source the ROS environment:
+
+```bash
+source /opt/ros/noetic/setup.bash
+source /root/crazyswarm/ros_ws/devel/setup.bash
+```
+
+Run the trajectory replay in dry-run mode first:
+
+```bash
+python3 follow_sim_trajectory_node.py \
+  --trajectory /root/seamlis/trajectories/cf6_cf12_simple.csv \
+  --cf_ids 6,12 \
+  --z 0.6 \
+  --rate_hz 30 \
+  --time_scale 3.0 \
+  --dry_run
+```
+
+The `--dry_run` flag checks the trajectory replay logic without sending real movement commands to the Crazyflies.
+
+Use this step to verify:
+
+- The trajectory file exists.
+- The Crazyflie IDs are correct.
+- The trajectory format is valid.
+- The replay node can read the CSV file.
+- The timing and command generation look reasonable.
+
+---
+
+## Terminal 3: Real Trajectory Replay
+
+If the dry run is correct, run the real replay:
+
+```bash
+python3 follow_sim_trajectory_node.py \
+  --trajectory /root/seamlis/trajectories/cf6_cf12_simple.csv \
+  --cf_ids 6,12 \
+  --z 0.6 \
+  --rate_hz 30 \
+  --time_scale 3.0
+```
+
+This sends the generated trajectory references to Crazyflies `cf6` and `cf12`.
+
+---
+
+## 🧾 Mode 2 Command Arguments
+
+| Argument | Description |
+|---|---|
+| `--trajectory` | Path to the SEAMLiS-generated trajectory CSV file |
+| `--cf_ids` | Crazyflie IDs used in the replay |
+| `--z` | Fixed flight height for trajectory replay |
+| `--rate_hz` | Command publishing rate |
+| `--time_scale` | Time scaling factor for slowing down or speeding up the trajectory |
+| `--dry_run` | Test mode that does not send real motion commands |
+
+---
+
+## ✅ Recommended Mode 2 Procedure
+
+For safety, use the following order:
+
+1. Start Crazyswarm.
+2. Make sure the Crazyflies are selected and rebooted.
+3. Confirm that Vicon is tracking the Crazyflies.
+4. Start ROS bag recording.
+5. Run the trajectory replay with `--dry_run`.
+6. Check that the trajectory file and Crazyflie IDs are correct.
+7. Run the real trajectory replay.
+8. Stop the ROS bag recording after the experiment.
+9. Analyze the recorded bag file.
+
+---
+
+## ⚠️ Mode 2 Safety Notes
+
+- Always run `--dry_run` before real replay.
+- Start with a safe height such as `--z 0.6`.
+- Use a larger `--time_scale` value to slow down the trajectory.
+- Make sure the generated trajectory stays inside the Vicon tracking space.
+- Make sure the trajectory does not collide with obstacles or other Crazyflies.
+- Confirm that `/cf6/state`, `/cf12/state`, `/cf6/cmd_position`, and `/cf12/cmd_position` are being recorded.
 
 # 📁 Repository Structure
 
