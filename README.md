@@ -221,8 +221,11 @@ The workflow is:
 
 ## 🧭 Mode 2 Launch Instructions
 
-Open multiple terminals.
-
+Run this ouside of Docker to collect the trajectory:
+```bash
+uv run python examples/flylab.py  --attitude gatekeeper   --w_max 1.6   --output_trajectory trajectories/cf6_cf12_gatekeeper.csv  --save_anim
+```
+After collecting the trajectory from seamlis, open multiple terminals.
 ---
 
 ## Terminal 1: Start Crazyswarm
