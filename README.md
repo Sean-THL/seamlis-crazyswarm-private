@@ -40,11 +40,11 @@ Vicon → cf_state_publisher.py → SEAMLiS → Crazyflie reference → Crazyfli
 
 The workflow is:
 
-1. Vicon tracks the Crazyflie position and orientation.
-2. `cf_state_publisher.py` publishes the Crazyflie state to ROS.
+1. Vicon tracks the Crazyflie position and orientation (only when attaching 3 or more markers).
+2. `cf_state_publisher.py` publishes the Crazyflie state (x,y,z) to ROS.
 3. SEAMLiS reads the current Crazyflie state.
 4. SEAMLiS computes the exploration/control reference.
-5. The Crazyflie tracks the generated reference.
+5. The Crazyflie tracks the generated reference trajectory.
 
 ---
 
@@ -60,12 +60,14 @@ python3 chooser.py
 ```
 
 Use the GUI to select the Crazyflies that will be used in the experiment.
+And check the .yaml file to place them in the inital position (e.g. cf6 in (-1.0 ,0.0, pi/2)), yaw angle can be ignored if drone has single marker
 
 After selecting the Crazyflies:
 
 1. Click **Reboot**.
 2. Wait for the Crazyflies to reboot.
-3. Press `Ctrl + C` to exit the GUI.
+3. If /timeout shows in terminal, check the DASC-Crazyflie documentation
+4. Press `Ctrl + C` to exit the GUI.
 
 ---
 
@@ -78,6 +80,10 @@ roslaunch crazyswarm hover_swarm.launch
 This starts the Crazyswarm launch file for hovering and swarm operation.
 
 At this stage, the Vicon system should start tracking the markers on the Crazyflies.
+Can check whether Vicon gives the information Crazyflies by:
+```bash
+rostopic echo -n 3 /cf{id}/state
+```
 
 ---
 
@@ -100,6 +106,9 @@ The published state is used by SEAMLiS as feedback for closed-loop exploration a
 cd seamlis
 python3 exploration_swarm.py
 ```
+--attitude for attitude controller selection
+--num_agent for number of cf operating
+--w_max for max yaw selection
 
 This runs the SEAMLiS exploration controller for the Crazyflie swarm.
 
@@ -107,6 +116,7 @@ SEAMLiS computes the desired control reference based on:
 
 - Current Crazyflie state
 - Exploration map
+- Environment information
 - Obstacle information
 - Controller settings
 - Safety constraints
@@ -118,7 +128,20 @@ SEAMLiS computes the desired control reference based on:
 To record all ROS topics:
 
 ```bash
-rosbag record -a
+
+  mkdir -p /root/crazyswarm/bags
+  cd /root/crazyswarm/bags/
+
+  rosbag record \
+    -O seamlis_simple_$(date +%Y%m%d_%H%M%S).bag \
+    /cf6/state \
+    /cf12/state \
+    /cf6/cmd_position \
+    /cf12/cmd_position \
+    /tf \
+    /tf_static \
+    /rosout
+
 ```
 
 To record selected topics only:
@@ -247,6 +270,76 @@ rostopic echo /tf
 ```
 
 ---
+
+Process with ROS bag
+  1. Record bag
+
+  Make sure cf_state_publisher_node.py is running if you want real measured trajectories.
+
+  rosbag record \
+    -O seamlis_test.bag \
+    /cf6/state \
+    /cf12/state \
+    /cf6/cmd_position \
+    /cf12/cmd_position \
+    /tf \
+    /tf_static \
+    /rosout
+
+  2. Check bag
+
+  rosbag info seamlis_test.bag
+
+  Confirm it contains:
+
+  /cf6/state
+  /cf12/state
+  /cf6/cmd_position
+  /cf12/cmd_position
+
+  3. Extract CSVs
+
+  rostopic echo -b seamlis_test.bag -p /cf6/state > cf6_state.csv
+  rostopic echo -b seamlis_test.bag -p /cf6/cmd_position > cf6_cmd_position.csv
+  rostopic echo -b seamlis_test.bag -p /cf12/state > cf12_state.csv
+  rostopic echo -b seamlis_test.bag -p /cf12/cmd_position > cf12_cmd_position.csv
+
+  4. Put CSVs in one folder
+
+  Example:
+
+  /home/robin/Safe_exploratin/DASC-Crazyflie/crazyswarm/bags/trajectory_replay/gatekeeper
+
+  Required names:
+
+  cf6_state.csv
+  cf6_cmd_position.csv
+  cf12_state.csv
+  cf12_cmd_position.csv
+
+  5. Visualize animation
+
+  cd /home/robin/Safe_exploratin/seamlis
+
+  uv run python visualize_rosbag_csv.py \
+    --bag_dir /home/robin/Safe_exploratin/DASC-Crazyflie/crazyswarm/bags/trajectory_replay/
+  gatekeeper \
+    --cf_ids 6,12 \
+    --animate \
+    --show_cmd
+
+  6. Save video
+
+  uv run python visualize_rosbag_csv.py \
+    --bag_dir /home/robin/Safe_exploratin/DASC-Crazyflie/crazyswarm/bags/trajectory_replay/
+  gatekeeper \
+    --cf_ids 6,12 \
+    --animate \
+    --show_cmd \
+    --output trajectory_gatekeeper.mp4 \
+    --fps 20 \
+    --no_show
+
 
 ## ⚠️ Troubleshooting
 
