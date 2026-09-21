@@ -1,780 +1,392 @@
-# 🚁 DASC Crazyflie Swarm + SEAMLiS
+# SEAMLiS + Crazyswarm
 
-Run a Crazyflie swarm with SEAMLiS exploration using ROS1 inside Docker.
+**Visibility-aware safety for perception-limited multi-robot exploration, from simulation to Crazyflie hardware.**
 
-This repository integrates the DASC Crazyflie control stack with SEAMLiS, allowing Crazyflie drones to perform exploration and trajectory-following experiments in a Vicon-tracked environment.
+[Paper](https://arxiv.org/abs/2607.09959) · [HTML](https://arxiv.org/html/2607.09959v1) · [Project page](https://www.taekyung.me/seamlis) · [Upstream SEAMLiS](https://github.com/tkkim-robot/seamlis)
 
-Two operation modes are supported:
+This repository integrates **SEAMLiS** (Safe Exploration for Autonomous Multi-Robot Systems Under Limited Sensing) with the ROS 1 version of [Crazyswarm](https://github.com/USC-ACTLab/crazyswarm). SEAMLiS is an execution-layer safety framework: it leaves the exploration goal allocator and local planner intact, then filters attitude and position commands so robots can explore with finite sensing range and a limited field of view (FoV) without discovering hidden obstacles too late to avoid them.
 
-1. **Closed-loop SEAMLiS control with Vicon feedback**
-2. **SEAMLiS trajectory generation + Crazyflie trajectory following**
+It includes decentralized frontier and CoScan-inspired exploration, A* local planning, a gatekeeper attitude filter, MPC-CBF/CBF-QP position control, randomized simulation and benchmarking, and a Dockerized ROS Noetic/Crazyswarm hardware stack.
 
----
+> [!IMPORTANT]
+> The paper reports a ROS 2 hardware implementation. This repository provides a **ROS 1 Noetic/Crazyswarm implementation of the same experimental architecture**. In the hardware experiment, limited-FoV detections are generated geometrically from Vicon pose; an onboard RGB-D camera is not required.
 
-## 📦 Setup
+## Why SEAMLiS?
 
-Start the Docker container:
+Exploration stacks usually plan toward informative frontiers while a local controller avoids obstacles already in the map. With limited FoV, those layers can work correctly in isolation and still be unsafe together. A quadrotor can translate sideways while its sensor looks toward an information-rich region, leaving the direction of travel unobserved. If a hidden obstacle appears only after the vehicle is too close to brake, a CBF controller cannot recover feasibility retroactively.
 
-```bash
-cd DASC_Crazyflie
-docker compose up -d
-docker exec -it dasc-crazyflie-ros-1 bash
-```
-
-All commands below should be executed inside the Docker container.
-
----
-
-# 🚀 Operation Mode 1: Closed-Loop SEAMLiS Control
-
-In this mode, the Vicon system provides the real-time Crazyflie state.
-
-The state is published into ROS, SEAMLiS receives the current state, computes the control input, and sends the generated reference back to the Crazyflie.
-
-This is the main workflow for real-time exploration experiments.
-
----
-
-## 🔁 Mode 1 System Pipeline
+SEAMLiS addresses this gap below the planner:
 
 ```text
-Vicon → cf_state_publisher.py → SEAMLiS → Crazyflie reference → Crazyflie
+local/received frontiers
+          │
+          ▼
+ goal allocation ──► A* waypoint path ──► nominal position + yaw commands
+                                                │
+                    ┌───────────────────────────┴──────────────────────────┐
+                    ▼                                                      ▼
+      gatekeeper attitude filter                              MPC-CBF position filter
+  nominal: visibility/information gain                 known + detected + robot obstacles
+  backup: align sensor with velocity                                  │
+                    └───────────────────────────┬──────────────────────┘
+                                                ▼
+                                      safe command to robot
+                                                │
+                          localization + finite-FoV sensing feedback
 ```
 
-The workflow is:
+The safety layer only requires a waypoint path and each robot's local map, so the upstream allocator is interchangeable.
 
-1. Vicon tracks the Crazyflie position and orientation.
-   - For full position and orientation tracking, attach **3 or more markers**.
-   - If the drone only has a single marker, yaw angle can be ignored.
-2. `cf_state_publisher.py` publishes the Crazyflie state to ROS.
-3. SEAMLiS reads the current Crazyflie state.
-4. SEAMLiS computes the exploration/control reference.
-5. The Crazyflie tracks the generated reference trajectory.
+## Theory in brief
 
----
+### Dynamics and sensing
 
-## 🧭 Mode 1 Launch Instructions
+Each planar robot is modeled as a double integrator with independently controlled yaw:
 
-Open multiple terminals inside the Docker container.
+$$
+\dot p_i=v_i,\qquad \dot v_i=a_i,\qquad \dot\theta_i=\omega_i,
+$$
 
----
+with bounded speed, acceleration, and yaw rate. The worst-case braking distance is
 
-## Terminal 1: Select Crazyflies
+$$
+d_{\mathrm{br}}=\frac{v_{\max}^2}{2a_{\max}}.
+$$
+
+The sensor footprint is a range-limited horizontal FoV sector with line-of-sight checking. Each robot accumulates its own known-free set $B_i$, known-obstacle set $O_i$, and unknown set $U_i$. Maps and obstacle lists are not assumed to be shared.
+
+### Visibility-safety condition
+
+Let the **critical point** $p_i^c$ be the first place where the current planned path intersects the boundary of the robot's known-free region. Let $d_i^c$ be path distance to that point, and let $\Delta\theta_i^c$ be the angular rotation required to bring it into the FoV. SEAMLiS uses
+
+$$
+h_i^{\mathrm{vis}}
+=d_i^c-d_{\mathrm{br}}-\frac{v_{\max}}{\omega_{\max}}\Delta\theta_i^c.
+$$
+
+The condition $h_i^{\mathrm{vis}}\ge 0$ means the robot can rotate the critical boundary into view and still retain a full worst-case braking distance. This is the link between perception and control: motion-relevant unknown space must become visible while avoidance is still feasible.
+
+### Gatekeeper attitude filter
+
+The nominal yaw policy points the FoV toward the heading with the largest estimated newly observed area. This improves mapping speed but can turn the sensor away from motion. The backup policy aligns yaw with velocity.
+
+At each update, gatekeeper predicts a candidate yaw trajectory using the nominal policy for switching duration $T_S$, followed by the backup policy for horizon $T_B$. It commits the longest candidate that keeps $h_i^{\mathrm{vis}}\ge0$ and reaches a terminal state where the critical point is visible (or absent from the look-ahead path). If no positive nominal duration is certified, the backup is applied immediately. Information-greedy sensing is therefore retained whenever it is recoverably safe.
+
+### Positional CBF filter
+
+For a circular obstacle $j$, the distance safety function is
+
+$$
+h_{ij}^{\mathrm{obs}}=\|p_i-o_j\|^2-r_{\mathrm{safe},ij}^2.
+$$
+
+Because acceleration appears after two derivatives, the controller applies a relative-degree-two high-order CBF condition,
+
+$$
+\ddot h+\alpha_1\dot h+\alpha_0h\ge0,
+$$
+
+inside a QP or MPC-CBF problem that stays close to nominal tracking. Pairwise constraints maintain inter-robot separation; this implementation also accounts for neighboring velocity as a moving obstacle.
+
+Under the paper's assumptions—bounded estimation/mapping error, a visibility-safe initial condition, correct local detection, recursive gatekeeper feasibility, and a nonempty CBF-admissible input set—the visibility filter guarantees timely detection and the position filter guarantees collision avoidance. These are sufficient conditions, not a claim that arbitrary tuning or inaccurate sensing is safe.
+
+## Paper results
+
+The paper evaluates 1–3 robots with frontier and decentralized CoScan-inspired assignment. In 100 randomized trials per configuration, SEAMLiS completed every reported setting with zero collisions. Always tracking velocity with yaw was also collision-free but timed out in every reported setting; unconstrained visibility-promoting and constant-yaw policies were faster in some cases but collided under multi-robot limited sensing. The same qualitative behavior was demonstrated in Isaac Sim and with two physical Crazyflies.
+
+Read the [paper](https://arxiv.org/abs/2607.09959) for the complete settings, ablations, assumptions, and proofs.
+
+## Repository layout
+
+```text
+.
+├── seamlis/
+│   ├── exploration.py                 # exploration manager and local maps
+│   ├── exploration_crazyswarm.py      # live ROS/Crazyswarm controller
+│   ├── tracking_controller.py         # attitude + position safety stack
+│   ├── position_controller.py         # moving-agent MPC-CBF extension
+│   ├── algorithms/                    # frontier and CoScan-inspired allocators
+│   ├── safe_control/                  # robot models, CBF/MPC, gatekeeper
+│   ├── examples/                      # simulation, benchmark, lab geometry
+│   └── record_sim_trajectory.py       # simulation-to-hardware CSV export
+└── DASC-Crazyflie/
+    ├── Dockerfile
+    ├── docker-compose.yaml
+    └── crazyswarm/ros_ws/src/crazyswarm/
+        ├── launch/seamlis_crazyswarm.launch
+        └── scripts/                   # ROS adapters, chooser, replay, emergency stop
+```
+
+## Simulation quick start
+
+Simulation requires Python 3.9 or newer and [`uv`](https://docs.astral.sh/uv/).
 
 ```bash
-cd $SHORT
-python3 chooser.py
+git clone --recursive git@github.com:Sean-THL/seamlis-crazyswarm-private.git
+cd seamlis-crazyswarm-private/seamlis
+uv sync
+
+# Default: two robots, indoor map, frontier allocation, unknown obstacles
+uv run python examples/test_exploration.py --num_agent 2
 ```
 
-Use the GUI to select the Crazyflies that will be used in the experiment.
-
-Before running the experiment, also check the `.yaml` file and place the Crazyflies in their initial positions.
-
-Example:
-
-```yaml
-cf6:
-  initialPosition: [-1.0, 0.0, 0.0]
-```
-
-If the Crazyflie only has a single marker, yaw angle can be ignored.
-
-After selecting the Crazyflies:
-
-1. Click **Reboot**.
-2. Wait for the Crazyflies to reboot.
-3. If `/timeout` appears in the terminal, check the DASC-Crazyflie documentation.
-4. Press `Ctrl + C` to exit the GUI.
-
----
-
-## Terminal 2: Start Crazyswarm
+Useful variants:
 
 ```bash
-roslaunch crazyswarm hover_swarm.launch
+# One-robot sanity check without hidden obstacles
+uv run python examples/test_exploration.py --num_agent 1 --no-unknown
+
+# Decentralized CoScan-inspired assignment with SEAMLiS
+uv run python examples/test_exploration.py \
+  --num_agent 2 --algo coscan --attitude gatekeeper
+
+# Compare an unfiltered visibility-promoting baseline
+uv run python examples/test_exploration.py \
+  --num_agent 2 --algo coscan --attitude visibility_area
+
+# Save an animation
+uv run python examples/test_exploration.py --num_agent 2 --save_anim
 ```
 
-This starts the Crazyswarm launch file for hovering and swarm operation.
+Primary options include `--num_agent {1,2,3}`, `--algo {frontier,coscan}`, `--attitude {gatekeeper,velocity_tracking_yaw,visibility_area,simple,...}`, `--layout {indoor,open}`, `--unknown_profile {default,stress}`, and `--use_astar`/`--no-astar`. See [`seamlis/README.md`](seamlis/README.md) for the full option list.
 
-At this stage, the Vicon system should start tracking the markers on the Crazyflies.
-
-To check whether Vicon is providing Crazyflie state information, use:
-
-```bash
-rostopic echo -n 3 /cf{id}/state
-```
-
-Example:
-
-```bash
-rostopic echo -n 3 /cf6/state
-```
-
----
-
-## Terminal 3: Publish Crazyflie State
-
-```bash
-cd $SHORT
-python3 cf_state_publisher.py
-```
-
-This publishes the Crazyflie state information to ROS so that SEAMLiS can receive the current robot state.
-
-The published state is used by SEAMLiS as feedback for closed-loop exploration and control.
-
----
-
-## Terminal 4: Run SEAMLiS Exploration
+### Randomized benchmark
 
 ```bash
 cd seamlis
-python3 exploration_swarm.py
+uv run python examples/benchmark_random_exploration.py \
+  --seed 42 --num_trials 100 --dt 0.1 --tf 300 \
+  --coverage_target 0.98 --workers 8 \
+  --output_dir output/benchmark_seed42
 ```
 
-Useful command-line arguments:
+Runs report coverage/success, collisions, visibility or unknown-region violations, and gatekeeper acceptance statistics.
+
+## Hardware implementation
+
+### Experimental setup
+
+| Component | Paper configuration |
+|---|---|
+| Vehicles | 2 × Crazyflie quadrotors |
+| Localization | Vicon motion capture |
+| Workspace | approximately 3.35 m × 3.50 m |
+| Flight plane | fixed height, $z=1.0$ m |
+| Robot radius | 0.075 m |
+| Hidden obstacle | circular, center $(0,0)$ in Vicon, radius 0.30 m |
+| Modeled sensor | 70° horizontal FoV, 0.25 m range |
+| Limits | $v_{\max}=1.35$ m/s, $a_{\max}=1.5$ m/s² |
+| Position safety | MPC-CBF, horizon 10, $\alpha_0=\alpha_1=0.55$ |
+| Attitude safety | nominal horizon 0.4 s, backup horizon 1.8 s |
+| Communication | states and frontier information; no maps or obstacle lists |
+
+The lab geometry is configured in [`seamlis/examples/flylab.py`](seamlis/examples/flylab.py). It converts between Vicon and planner frames, defines the flight boundary, and places the hidden obstacle. **Measure your workspace and update these constants before flying.** Repository defaults may differ from paper parameters: for example, the current live profile uses a 0.8 m modeled camera range.
+
+### Data and command path
 
 ```text
---attitude   Select the attitude controller
---num_agent  Set the number of Crazyflies operating
---w_max      Set the maximum yaw rate
+Vicon
+  └─► Crazyswarm TF (/world → /cf<ID>)
+        └─► cf_state_publisher_node.py → /cf<ID>/state
+              └─► exploration_crazyswarm.py
+                    ├─ local FoV/map + frontier/A*
+                    ├─ gatekeeper yaw filter
+                    └─ MPC-CBF position filter
+                          └─► /cf<ID>/cmd_position → radio → Crazyflie
 ```
 
-Example:
+The live controller estimates planar velocity from Vicon, synchronizes the SEAMLiS model to measured state, projects acceleration/yaw outputs to bounded position steps, converts back to the Vicon frame, and publishes a fixed-height command. The launch file publishes measured yaw by default; set `publish_current_yaw:=false` to command gatekeeper-predicted yaw.
+
+### Prerequisites
+
+- Ubuntu host with Docker Engine and Compose
+- Crazyradio PA/2.1 hardware and Bitcraze udev permissions
+- Crazyflie 2.x vehicles with correctly installed propellers and charged batteries
+- Vicon on the same network, with a `cf<ID>` rigid body for every vehicle
+- a clear, netted flight area and a physical emergency-stop procedure
+
+> [!CAUTION]
+> This is research flight software. Validate in simulation, test with propellers removed, use conservative limits, keep the flight volume clear, and have an operator ready to stop/land every vehicle. The guarantee does not cover configuration errors, stale mocap, packet loss, unmodeled dynamics, or solver failure.
+
+### 1. Configure vehicles and Vicon
+
+Edit:
+
+- `DASC-Crazyflie/crazyswarm/ros_ws/src/crazyswarm/launch/allCrazyflies.yaml` for available IDs, channels, types, and initial positions;
+- `.../launch/crazyflies.yaml` for vehicles active in this run (the chooser updates it); and
+- `.../launch/hover_swarm.launch` for `motion_capture_host_name` and firmware estimator/controller.
+
+The launch file currently points to `192.168.1.115`; change it for your Vicon server.
+
+### 2. Build the container and Crazyswarm
 
 ```bash
-python3 exploration_swarm.py --num_agent 2 --attitude gatekeeper --w_max 1.0
+cd DASC-Crazyflie
+xhost +local:docker
+docker compose build
+docker compose up -d
+docker compose exec ros bash
 ```
 
-This runs the SEAMLiS exploration controller for the Crazyflie swarm.
-
-SEAMLiS computes the desired control reference based on:
-
-- Current Crazyflie state
-- Exploration map
-- Environment information
-- Obstacle information
-- Controller settings
-- Safety constraints
-
----
-
-## Terminal 5: Record ROS Bag Optional
-
-Create a directory for ROS bag recording:
-
-```bash
-mkdir -p /root/crazyswarm/bags
-cd /root/crazyswarm/bags/
-```
-
-Record selected topics:
-
-```bash
-rosbag record \
-  -O seamlis_simple_$(date +%Y%m%d_%H%M%S).bag \
-  /cf6/state \
-  /cf12/state \
-  /cf6/cmd_position \
-  /cf12/cmd_position \
-  /tf \
-  /tf_static \
-  /rosout
-```
-
-To record all ROS topics:
-
-```bash
-rosbag record -a
-```
-
-ROS bag recording is useful for debugging, experiment analysis, and replaying data after the flight.
-
----
-
-# 🚀 Operation Mode 2: SEAMLiS Trajectory Generation + Crazyflie Tracking
-
-In this mode, SEAMLiS is used to generate a trajectory first.  
-The Crazyflies then follow the pre-generated trajectory using Crazyswarm.
-
-This mode separates trajectory generation from real-time SEAMLiS feedback control.
-
----
-
-## 🔁 Mode 2 System Pipeline
-
-```text
-SEAMLiS trajectory CSV → follow_sim_trajectory_node.py → Crazyflie cmd_position → Crazyflie
-```
-
-The workflow is:
-
-1. Generate a trajectory from SEAMLiS.
-2. Save the trajectory as a `.csv` file.
-3. Start Crazyswarm.
-4. Record ROS bag data.
-5. Run a dry replay first.
-6. If the dry run is correct, run the real trajectory replay.
-7. The Crazyflies follow the generated trajectory.
-
----
-
-## 🧭 Mode 2 Launch Instructions
-
-Run this ouside of Docker to collect the trajectory:
-```bash
-uv run python examples/flylab.py  --attitude gatekeeper   --w_max 1.6   --output_trajectory trajectories/cf6_cf12_gatekeeper.csv  --save_anim
-```
-After collecting the trajectory from seamlis, open multiple terminals.
-
----
-
-## Terminal 1: Start Crazyswarm
-
-If Crazyswarm is not already running, start it first:
+Inside the container:
 
 ```bash
 cd /root/crazyswarm
-source /opt/ros/noetic/setup.bash
-source /root/crazyswarm/ros_ws/devel/setup.bash
-
-roslaunch crazyswarm hover_swarm.launch use_rviz:=false
+./build.sh
+source ros_ws/devel/setup.bash
 ```
 
-This starts the Crazyswarm hover and swarm operation launch file.
+Compose mounts Crazyswarm at `/root/crazyswarm`, SEAMLiS at `/root/seamlis`, exposes USB devices, and uses host networking for ROS and Vicon.
 
-The argument:
-
-```bash
-use_rviz:=false
-```
-
-disables RViz during trajectory replay.
-
----
-
-## Terminal 2: Record ROS Bag
-
-Open a new terminal and enter the Docker container:
-
-```bash
-docker exec -it dasc-crazyflie-ros-1 bash
-```
-
-Source the ROS environment:
-
-```bash
-source /opt/ros/noetic/setup.bash
-source /root/crazyswarm/ros_ws/devel/setup.bash
-```
-
-Create a folder for the simple trajectory replay bag:
-
-```bash
-mkdir -p /root/crazyswarm/bags/trajectory_replay/simple
-cd /root/crazyswarm/bags/trajectory_replay/simple
-```
-
-Record the required ROS topics:
-
-```bash
-rosbag record \
-  -O seamlis_simple_$(date +%Y%m%d_%H%M%S).bag \
-  /cf6/state \
-  /cf12/state \
-  /cf6/cmd_position \
-  /cf12/cmd_position \
-  /tf \
-  /tf_static \
-  /rosout
-```
-
-This records both the measured Crazyflie states and the commanded trajectory references.
-
----
-
-## Terminal 3: Dry Run Trajectory Replay
-
-Open another terminal and enter the Docker container:
-
-```bash
-docker exec -it dasc-crazyflie-ros-1 bash
-```
-
-Go to the Crazyswarm scripts directory:
+### 3. Select active Crazyflies
 
 ```bash
 cd /root/crazyswarm/ros_ws/src/crazyswarm/scripts
+python3 chooser.py
 ```
 
-Source the ROS environment:
+Select the vehicles, click **Reboot**, wait for reconnection, close the chooser, and verify `launch/crazyflies.yaml`.
+
+### 4. Preflight
+
+Start state tracking without exploration:
 
 ```bash
-source /opt/ros/noetic/setup.bash
-source /root/crazyswarm/ros_ws/devel/setup.bash
+roslaunch crazyswarm seamlis_crazyswarm.launch \
+  run_exploration:=false use_rviz:=false
 ```
 
-Run the trajectory replay in dry-run mode first:
+In another container shell:
 
 ```bash
-python3 follow_sim_trajectory_node.py \
-  --trajectory /root/seamlis/trajectories/cf6_cf12_simple.csv \
-  --cf_ids 6,12 \
-  --z 0.6 \
-  --rate_hz 30 \
-  --time_scale 3.0 \
-  --dry_run
+rostopic echo -n 1 /cf6/state       # replace 6 with an active ID
+rosparam get /crazyflies
+rosnode list
 ```
 
-The `--dry_run` flag checks the trajectory replay logic without sending real movement commands to the Crazyflies.
+Confirm that physical and reported poses agree, axes match `flylab.py`, the obstacle is at its configured coordinate, and no vehicle starts inside an obstacle or outside the workspace.
 
-Use this step to verify:
+### 5. Run live SEAMLiS
 
-- The trajectory file exists.
-- The Crazyflie IDs are correct.
-- The trajectory format is valid.
-- The replay node can read the CSV file.
-- The timing and command generation look reasonable.
+Stop the preflight launch, clear the workspace, and run:
 
----
-
-## Terminal 3: Real Trajectory Replay
-
-If the dry run is correct, run the real replay:
+> [!WARNING]
+> This integrated launch begins publishing live position commands as soon as all configured state topics are ready. Start it only when the vehicles, operator, and flight volume are ready for motion.
 
 ```bash
-python3 follow_sim_trajectory_node.py \
-  --trajectory /root/seamlis/trajectories/cf6_cf12_simple.csv \
-  --cf_ids 6,12 \
-  --z 0.6 \
-  --rate_hz 30 \
-  --time_scale 3.0
+roslaunch crazyswarm seamlis_crazyswarm.launch \
+  use_rviz:=false \
+  algo:=frontier \
+  attitude:=gatekeeper \
+  pos_controller:=mpc_cbf \
+  publish_current_yaw:=false
 ```
 
-This sends the generated trajectory references to Crazyflies `cf6` and `cf12`.
+The agent count is inferred from `/crazyflies`; if supplied, `num_agent` must match. To attach to an already-running server:
 
----
+```bash
+roslaunch crazyswarm seamlis_crazyswarm.launch \
+  start_crazyswarm:=false load_cf_params:=true use_rviz:=false
+```
 
-## 🧾 Mode 2 Command Arguments
+Record a trial in a separate shell:
 
-| Argument | Description |
+```bash
+rosbag record -O seamlis_trial.bag \
+  /tf /tf_static /seamlis/exploration_done \
+  /cf6/state /cf6/cmd_position \
+  /cf7/state /cf7/cmd_position
+```
+
+Replace the IDs. On reaching the coverage target, the controller publishes `true` on `/seamlis/exploration_done`. The live node sends `/cmd_position` directly and does **not** automatically land; land through your established Crazyswarm procedure after it stops.
+
+### Staged workflow: simulate, inspect, replay
+
+Generate a hardware-frame CSV without flying:
+
+```bash
+cd /root/seamlis
+python3 record_sim_trajectory.py \
+  --cf_ids 6,7 --num_agent 2 \
+  --algo frontier --attitude gatekeeper \
+  --output trajectories/seamlis_sim_trajectory.csv
+```
+
+Inspect with dry-run first:
+
+```bash
+rosrun crazyswarm follow_sim_trajectory_node.py \
+  --trajectory /root/seamlis/trajectories/seamlis_sim_trajectory.csv \
+  --cf_ids 6,7 --dry_run
+```
+
+Remove `--dry_run` only after preflight, with vehicles at the expected initial positions and an appropriate takeoff/landing procedure.
+
+### Process and visualize ROS bags
+
+Inspect a recorded bag before extracting data:
+
+```bash
+rosbag info seamlis_trial.bag
+```
+
+Export measured and commanded positions for each vehicle (replace IDs as needed):
+
+```bash
+mkdir -p rosbag_csv
+rostopic echo -b seamlis_trial.bag -p /cf6/state > rosbag_csv/cf6_state.csv
+rostopic echo -b seamlis_trial.bag -p /cf6/cmd_position > rosbag_csv/cf6_cmd_position.csv
+rostopic echo -b seamlis_trial.bag -p /cf7/state > rosbag_csv/cf7_state.csv
+rostopic echo -b seamlis_trial.bag -p /cf7/cmd_position > rosbag_csv/cf7_cmd_position.csv
+```
+
+From `seamlis/`, render an interactive comparison:
+
+```bash
+uv run python visualize_rosbag_csv.py \
+  --bag_dir ../rosbag_csv \
+  --cf_ids 6,7 \
+  --animate --show_cmd --show_fov
+```
+
+Or save a headless MP4:
+
+```bash
+uv run python visualize_rosbag_csv.py \
+  --bag_dir ../rosbag_csv \
+  --cf_ids 6,7 \
+  --animate --show_cmd --show_fov \
+  --output trajectory_gatekeeper.mp4 --fps 20 --no_show
+```
+
+## Troubleshooting
+
+| Symptom | Checks |
 |---|---|
-| `--trajectory` | Path to the SEAMLiS-generated trajectory CSV file |
-| `--cf_ids` | Crazyflie IDs used in the replay |
-| `--z` | Fixed flight height for trajectory replay |
-| `--rate_hz` | Command publishing rate |
-| `--time_scale` | Time scaling factor for slowing down or speeding up the trajectory |
-| `--dry_run` | Test mode that does not send real motion commands |
+| No `/cf<ID>/state` | Vicon rigid body, server IP, `/world → /cf<ID>` TF, and IDs in `crazyflies.yaml`. |
+| Crazyflie does not move | Vehicle selected/rebooted, radio recognized, server running, and `/cf<ID>/cmd_position` active. |
+| Qt/`xcb` error | Use `use_rviz:=false`; for GUIs, allow local Docker X access and check `DISPLAY`. |
+| Flip at takeoff | Stop; check ID/body association, propellers, battery leads, estimator convergence, and PID selection. |
+| One vehicle follows another's pose | Crazyflie IDs and Vicon rigid-body names are swapped or duplicated. |
+| Exploration stops immediately | Check preflight collision logs, initial coordinates, obstacle definition, frontier count, and coverage. |
+| MPC infeasible/aggressive | Reduce limits, enlarge margins, confirm map scale, and inspect solver output before flying again. |
+| Hidden obstacle is missed | Check FoV/range, Vicon-to-map transform, yaw convention, and `flylab.py` obstacle coordinates. |
 
----
+More radio, firmware, and Crazyswarm notes are in [`DASC-Crazyflie/README.md`](DASC-Crazyflie/README.md) and the [Crazyswarm documentation](https://crazyswarm.readthedocs.io/).
 
-## ✅ Recommended Mode 2 Procedure
+## Citation
 
-For safety, use the following order:
-
-1. Start Crazyswarm.
-2. Make sure the Crazyflies are selected and rebooted.
-3. Confirm that Vicon is tracking the Crazyflies.
-4. Start ROS bag recording.
-5. Run the trajectory replay with `--dry_run`.
-6. Check that the trajectory file and Crazyflie IDs are correct.
-7. Run the real trajectory replay.
-8. Stop the ROS bag recording after the experiment.
-9. Analyze the recorded bag file.
-
----
-
-## ⚠️ Mode 2 Safety Notes
-
-- Always run `--dry_run` before real replay.
-- Start with a safe height such as `--z 0.6`.
-- Use a larger `--time_scale` value to slow down the trajectory.
-- Make sure the generated trajectory stays inside the Vicon tracking space.
-- Make sure the trajectory does not collide with obstacles or other Crazyflies.
-- Confirm that `/cf6/state`, `/cf12/state`, `/cf6/cmd_position`, and `/cf12/cmd_position` are being recorded.
-
-# 📁 Repository Structure
-
-```text
-DASC_Crazyflie/
-├── chooser.py
-├── cf_state_publisher.py
-├── seamlis/
-│   └── exploration_swarm.py
-├── docker-compose.yml
-└── README.md
+```bibtex
+@article{kim2026seamlis,
+  title   = {{SEAMLiS}: Visibility-Aware Safety for Perception-Limited
+             Multi-Robot Exploration},
+  author  = {Kim, Taekyung and Kumar, Rahul H. and Menon, Aswin D.
+             and Lin, Tzu-Hsiang and Panagou, Dimitra},
+  journal = {arXiv preprint arXiv:2607.09959},
+  year    = {2026}
+}
 ```
 
----
+## Acknowledgments and licensing
 
-# 📡 ROS Topics
-
-The following topics are commonly used during the experiment.
-
-```text
-/cf{id}/state
-/cf{id}/cmd_position
-/tf
-/tf_static
-/rosout
-/vrpn_client_node/<crazyflie_name>/pose
-```
-
-Example topics:
-
-```text
-/cf6/state
-/cf12/state
-/cf6/cmd_position
-/cf12/cmd_position
-```
-
-Topic names may vary depending on the Crazyflie configuration and Vicon rigid body naming.
-
----
-
-## Check Available Topics
-
-```bash
-rostopic list
-```
-
----
-
-## Check Crazyflie State
-
-```bash
-rostopic echo /cf6/state
-```
-
----
-
-## Check Crazyflie Command Position
-
-```bash
-rostopic echo /cf6/cmd_position
-```
-
----
-
-## Check TF
-
-```bash
-rostopic echo /tf
-```
-
----
-
-# 🎥 ROS Bag Processing Workflow
-
-This section explains how to record, check, extract, and visualize ROS bag data.
-
----
-
-## Step 1: Record ROS Bag
-
-Make sure `cf_state_publisher.py` is running if you want real measured trajectories.
-
-```bash
-rosbag record \
-  -O seamlis_test.bag \
-  /cf6/state \
-  /cf12/state \
-  /cf6/cmd_position \
-  /cf12/cmd_position \
-  /tf \
-  /tf_static \
-  /rosout
-```
-
----
-
-## Step 2: Check ROS Bag
-
-```bash
-rosbag info seamlis_test.bag
-```
-
-Confirm that the bag contains:
-
-```text
-/cf6/state
-/cf12/state
-/cf6/cmd_position
-/cf12/cmd_position
-```
-
----
-
-## Step 3: Extract CSV Files
-
-```bash
-rostopic echo -b seamlis_test.bag -p /cf6/state > cf6_state.csv
-rostopic echo -b seamlis_test.bag -p /cf6/cmd_position > cf6_cmd_position.csv
-
-rostopic echo -b seamlis_test.bag -p /cf12/state > cf12_state.csv
-rostopic echo -b seamlis_test.bag -p /cf12/cmd_position > cf12_cmd_position.csv
-```
-
----
-
-## Step 4: Put CSV Files in One Folder
-
-Example folder:
-
-```text
-/home/robin/Safe_exploratin/DASC-Crazyflie/crazyswarm/bags/trajectory_replay/gatekeeper
-```
-
-Required file names:
-
-```text
-cf6_state.csv
-cf6_cmd_position.csv
-cf12_state.csv
-cf12_cmd_position.csv
-```
-
----
-
-## Step 5: Visualize Animation
-
-Go to the SEAMLiS directory:
-
-```bash
-cd /home/robin/Safe_exploratin/seamlis
-```
-
-Run the visualization script:
-
-```bash
-uv run python visualize_rosbag_csv.py \
-  --bag_dir /home/robin/Safe_exploratin/DASC-Crazyflie/crazyswarm/bags/trajectory_replay/gatekeeper \
-  --cf_ids 6,12 \
-  --animate \
-  --show_cmd
-```
-
----
-
-## Step 6: Save Video
-
-```bash
-uv run python visualize_rosbag_csv.py \
-  --bag_dir /home/robin/Safe_exploratin/DASC-Crazyflie/crazyswarm/bags/trajectory_replay/gatekeeper \
-  --cf_ids 6,12 \
-  --animate \
-  --show_cmd \
-  --output trajectory_gatekeeper.mp4 \
-  --fps 20 \
-  --no_show
-```
-
----
-
-# ⚠️ Troubleshooting
-
----
-
-## No Vicon or TF Data
-
-Check whether VRPN/Vicon topics are available:
-
-```bash
-rostopic list | grep vrpn
-```
-
-You can also check TF topics:
-
-```bash
-rostopic list | grep tf
-```
-
-If no topics appear, make sure:
-
-- The Vicon system is running.
-- The VRPN client is connected.
-- The Crazyflie markers are visible to the Vicon cameras.
-- The correct Crazyflie rigid body names are being used.
-- The Vicon rigid body name matches the name expected by the ROS/Crazyswarm configuration.
-
----
-
-## Crazyflie Does Not Move
-
-Check the following:
-
-- The Crazyflie was selected in `chooser.py`.
-- **Reboot** was clicked after selection.
-- The Crazyflie battery is charged.
-- The radio connection is working.
-- The Crazyswarm launch file is running.
-- The reference topic is being published.
-- Vicon is tracking the Crazyflie correctly.
-- SEAMLiS is running without errors.
-- The generated reference is within the physical lab boundary.
-
-Check all published topics:
-
-```bash
-rostopic list
-```
-
-Check whether references are being published:
-
-```bash
-rostopic echo /cf6/cmd_position
-```
-
----
-
-## Exploration Finishes Too Quickly
-
-If exploration finishes too quickly, try reducing:
-
-- `cam_range`
-- `v_max`
-- `a_max`
-
-You may also need to increase the exploration environment size so that it better matches the physical lab space.
-
----
-
-## Motion Is Too Aggressive or Unstable
-
-If the Crazyflie motion is too aggressive, unstable, or unsafe, try reducing:
-
-- `v_max`
-- `a_max`
-
-You may also need to tune:
-
-- CBF controller gains
-- MPC horizon
-- MPC cost weights
-- Safety distance
-- Reference update rate
-- Goal reached threshold
-
-Start with conservative velocity and acceleration limits during real-world experiments.
-
----
-
-## Vicon Frame or World Frame Error
-
-If you see an error related to missing frames, such as:
-
-```text
-world passed to lookupTransform argument target_frame does not exist
-```
-
-Check whether the required TF frames are being published:
-
-```bash
-rostopic echo /tf
-```
-
-You can also generate a TF frame diagram:
-
-```bash
-rosrun tf view_frames
-```
-
-Make sure the following frames are consistent:
-
-- Vicon world frame
-- Crazyswarm world frame
-- Crazyflie body frame
-- SEAMLiS map frame
-
----
-
-## Reference Topic Is Not Published
-
-If the Crazyflie reference topic is not being published, check:
-
-- SEAMLiS is running.
-- The Crazyflie state is being received.
-- The controller is not stopped by safety constraints.
-- The robot has not already reached the goal.
-- The topic name in the publisher matches the topic expected by Crazyswarm.
-
-Use:
-
-```bash
-rostopic list
-rostopic echo /cf6/state
-rostopic echo /cf6/cmd_position
-```
-
----
-
-# 🧪 Experiment Notes
-
-- Run each launch command in a separate terminal inside the Docker container.
-- Start with low velocity and acceleration limits during real-world experiments.
-- Match the SEAMLiS exploration environment size to the physical lab space.
-- Make sure Vicon is tracking the Crazyflie before running closed-loop experiments.
-- Use ROS bag recording for debugging and experiment analysis.
-- Verify topic names before running the full experiment.
-- Test with one Crazyflie first before running the full swarm.
-- Increase controller aggressiveness only after stable low-speed tests.
-
----
-
-# ✅ Recommended Experiment Procedure
-
-For safety, use the following order during real-world experiments:
-
-1. Start the Docker container.
-2. Select and reboot the Crazyflies using `chooser.py`.
-3. Start Crazyswarm.
-4. Confirm that Vicon is tracking the Crazyflies.
-5. Run the Crazyflie state publisher.
-6. Check that Crazyflie states are being published.
-7. Run SEAMLiS.
-8. Check that reference commands are being published.
-9. Start with low velocity and acceleration limits.
-10. Record ROS bag data for later debugging.
-11. Increase controller aggressiveness only after stable low-speed tests.
-
----
-
-# 📌 Mode Comparison
-
-| Mode | Description | Best For |
-|---|---|---|
-| Mode 1 | Vicon provides real-time Crazyflie state and SEAMLiS computes control online | Closed-loop exploration |
-| Mode 2 | SEAMLiS generates the trajectory and Crazyflie follows it | Pre-planned trajectory tracking |
-
----
-
-# 📌 Summary
-
-This project connects DASC Crazyflie swarm control with SEAMLiS exploration.
-
-Two operation methods are supported:
-
----
-
-## Mode 1: Closed-Loop Control
-
-```text
-Vicon → Crazyflie state publisher → SEAMLiS → Crazyflie reference → Crazyflie
-```
-
-This mode is used for real-time exploration and feedback control.
-
----
-
-## Mode 2: Trajectory Following
-
-```text
-SEAMLiS trajectory generation → Crazyflie trajectory tracking → Crazyflie
-```
-
-This mode is used for testing pre-generated trajectories and planned paths.
-
-Mode 1 is the main workflow for real-time safe exploration.
-
-Mode 2 is useful for testing planned trajectories before running full closed-loop experiments.
+The flight stack is based on [Crazyswarm](https://github.com/USC-ACTLab/crazyswarm), developed by the USC ACT Lab, and includes its MIT license in `DASC-Crazyflie/crazyswarm/LICENSE`. SEAMLiS builds on the bundled `safe_control` framework. Check each bundled component's license before redistribution; no separate top-level license is currently provided for repository-specific code.
